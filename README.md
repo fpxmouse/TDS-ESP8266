@@ -50,6 +50,22 @@ api_encryption_key: "用 openssl rand -base64 32 生成"
 
 ## 4. 首次烧录与 OTA
 
+### 使用仓库 Release 的预编译 bin（无需自己编译）
+
+Release 中的固件不含任何个人 WiFi / HA 凭据，专门为首次配网设计：
+
+1. 下载并烧录 `tds-esp8266-v1.0.0-factory.bin`（USB 首次烧录；OTA 用 `-ota.bin`）。
+2. 上电后设备会先尝试连接示例 SSID `YOUR_WIFI_SSID`，失败后开启配网热点 `TDS-ESP8266-Setup`，密码 `12345678`。
+3. 手机或电脑连接该热点， captive portal 通常会自动弹出；若没有弹出，浏览器打开 `http://192.168.4.1`。
+4. 在页面里选择你的 WiFi 并输入密码，保存后设备重启并接入你的网络。
+5. 在路由器里找到设备 IP，浏览器打开 `http://<设备IP>` 可看到 ESPHome Web 界面。
+6. 在 HA 添加 ESPHome 设备时，使用 Release 说明中公布的 API 加密密钥：
+   `VERTLUVTUDgyNjYtUExBQ0VIT0xERVItS0VZLTAwMDE=`。
+
+预编译 bin 的 OTA 密码同为公开默认值 `12345678`。这些公开默认值只为了方便配网和演示；用于正式环境时请按下面步骤自行编译并改成强密码。
+
+### 自行编译（推荐用于正式使用）
+
 - 首次烧录：用 ESPHome Web UI 的 **Install** → 选择串口。
 - OTA 升级：设备在线后，用 **Install** → **Over the air**；也可命令行：
 
@@ -98,6 +114,7 @@ ESP8266 默认把 `restore_value` 存在 RTC memory，完全断电会丢。本�
 
 - 配置使用 `!secret wifi_ssid` / `!secret wifi_password`，没有本地 WiFi 凭据时无法编译。
 - 不要把本地 `secrets.yaml` 提交到仓库；OTA、Fallback AP 和 API 加密密钥都应使用强随机值。
+- Release 的预编译 bin 使用公开默认密码和公开 API 密钥；任何人都能连到该设备，正式使用前请自行编译并替换。
 - ESPHome 2026.11+ 已移除 `api: password:`；本仓库配置使用 `api: encryption: key: !secret api_encryption_key`。
 - TDS 串口帧解析假设帧头 `55 0A 85`、11 字节帧；若换 TDS 模块固件，需重新抓 UART 验证。
 - SNTP 未成功同步前，滤芯天数会显示 0，这是正常保护行为。
