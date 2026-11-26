@@ -34,7 +34,8 @@ wifi:
 
   # Enable fallback hotspot (captive portal) in case wifi connection fails
   ap:
-    ssid: "Tds-Esp8266 Fallback Hotspot"
+    # 预编译 Release 靠这个热点做首次配网；密码由 secrets 提供，Release 中为公开默认值。
+    ssid: "TDS-ESP8266-Setup"
     password: !secret fallback_ap_password
 
 captive_portal:
