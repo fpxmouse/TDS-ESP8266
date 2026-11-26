@@ -1,0 +1,702 @@
+esphome:
+  name: tds-esp8266
+  friendly_name: tds-esp8266
+  # HA 主机内存仅 1.8G，4 路并行编译 BearSSL 会被 OOM 杀掉；强制单线程
+  compile_process_limit: 1
+
+esp8266:
+  board: nodemcuv2
+  # 让所有 restore_value（含 number 阈值、datetime 滤芯日期）断电后仍保留。
+  # 默认关闭时这些值只存 RTC memory，完全断电会丢失。
+  restore_from_flash: true
+# Enable logging
+logger:
+  # level: VERBOSE #makes uart stream available in esphome logstream
+  baud_rate: 0 #disable logging over uart
+
+
+
+# Enable Home Assistant API
+api:
+  password: ""
+
+
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Tds-Esp8266 Fallback Hotspot"
+    password: !secret fallback_ap_password
+
+captive_portal:
+
+web_server:
+  port: 80
+
+# =====================================================================
+# 掉电保持的全局变量
+# 关键：ESP8266 默认把 restore_value 存 RTC memory，RTC 只在深度睡眠/
+# 软件复位保留，完全断电会丢失。必须逐个显式 storage: flash 才能真掉电保持。
+#   g_total_in / g_total_out   : 累计总用水量（升），存 flash，断电不丢
+#   g_midnight_in / g_midnight_out : 当日 0 点时的累计值，用于算“今日”
+#   g_last_day                 : 上次记录的“日”，用于跨天归零检测
+#   g_last_session_*           : 上次并入的总量基准，不持久化（重启归 0，
+#                                与 pulse_counter 的 session total 同步）
+# =====================================================================
+globals:
+  - id: g_total_in
+    type: float
+    restore_value: true
+    storage: flash
+    initial_value: '0.0'
+  - id: g_midnight_in
+    type: float
+    restore_value: true
+    storage: flash
+    initial_value: '0.0'
+  - id: g_total_out
+    type: float
+    restore_value: true
+    storage: flash
+    initial_value: '0.0'
+  - id: g_midnight_out
+    type: float
+    restore_value: true
+    storage: flash
+    initial_value: '0.0'
+  - id: g_last_day
+    type: int
+    restore_value: true
+    storage: flash
+    initial_value: '0'
+  - id: g_last_session_in
+    type: float
+    initial_value: '0.0'
+  - id: g_last_session_out
+    type: float
+    initial_value: '0.0'
+
+display:
+    platform: tm1637
+    id: tm1637_display
+    clk_pin: D1
+    dio_pin: D2
+    inverted: true
+    length: 4
+    intensity: 2
+    lambda: |-
+      if (id(tds_switch).state == false) {
+        it.print("    ");
+      } else {
+        // 只显示 TDS，不显示报警：每 3 秒在原水TDS(tds1, Raw) 与 纯水TDS(tds2, Purified) 间轮换。
+        if ((millis() / 3000) % 2 == 0) {
+          it.printf("%4.0f", id(tds1).state);
+        } else {
+          it.printf("%4.0f", id(tds2).state);
+        }
+      }
+
+uart:
+  - id: uart_bus1
+    tx_pin: TX
+    rx_pin: RX
+    baud_rate: 9600
+    # debug:
+      # direction: BOTH
+      # dummy_receiver: true
+      # after:
+      #   delimiter: "\n"
+      # sequence:
+      #   - lambda: UARTDebug::log_string(direction, bytes);
+
+# =====================================================================
+# TDS 串口解析（ESPHome 2026.11+ 已移除 platform: custom，
+# 这里改为纯 YAML：由下方 50ms interval 直接读 UART 帧并 publish_state）
+# 帧格式：55 0A 85 [通道] [TDS高] [TDS低] [温度高] [温度低] ... 共 11 字节
+#   TDS = (b4*255 + b5)/20  温度 = (b6*255 + b7)/10
+#   通道1 = 原水(Raw, tds1)  通道2 = 纯水(Purified, tds2) —— 实测确认
+# =====================================================================
+sensor:
+  - platform: template
+    id: tds1
+    name: "Raw Water TDS"       # 原水 TDS
+    unit_of_measurement: ppm
+    accuracy_decimals: 1
+    update_interval: never
+  - platform: template
+    id: temperature1
+    name: "Raw Water Temperature"
+    unit_of_measurement: °C
+    accuracy_decimals: 2
+    update_interval: never
+  - platform: template
+    id: tds2
+    name: "Purified Water TDS"
+    unit_of_measurement: ppm
+    accuracy_decimals: 1
+    update_interval: never
+  - platform: template
+    id: temperature2
+    name: "Purified Water Temperature"
+    unit_of_measurement: °C
+    accuracy_decimals: 2
+    update_interval: never
+
+#flow meter D6=pin12 = 进水(YF-S301, 1260 pulse/L);
+#        D5=pin14 = 纯水(YF-S402B, 1920 pulse/L);
+# 两个型号脉冲常数不同，必须分别换算，不能都用 1920。
+# 每个流量计拆成三块：
+#   1) pulse_counter 本体 -> 实时流量(L/min)，以及“本次上电以来的累计” (session total, internal)
+#   2) template 累计总量  = g_total_* + session，掉电保持（主修复点）
+#   3) template 今日总量  = 累计总量 - 当日0点基准
+
+  - platform: pulse_counter
+    pin: D6
+    name: "Raw Water Flow Rate"
+    id: in_rate
+    unit_of_measurement: 'L/min'
+    update_interval: 5s
+    filters:
+      - lambda: return (x / 1260.0);     # YF-S301: 1260 脉冲/升
+    total:
+      id: in_session_total
+      internal: true
+      unit_of_measurement: 'L'
+      device_class: water
+      state_class: total_increasing
+      filters:
+        - lambda: return (x / 1260.0);   # YF-S301: 1260 脉冲/升
+
+  - platform: template
+    id: total_in
+    name: "Total Raw Water Usage"
+    unit_of_measurement: 'L'
+    device_class: water
+    state_class: total_increasing
+    accuracy_decimals: 2
+    update_interval: 10s
+    lambda: 'return id(g_total_in);'
+
+  - platform: template
+    id: today_in
+    name: "Today's Raw Water Usage"
+    unit_of_measurement: 'L'
+    device_class: water
+    state_class: total
+    accuracy_decimals: 2
+    update_interval: 10s
+    lambda: 'return id(g_total_in) - id(g_midnight_in);'
+
+  - platform: pulse_counter
+    pin: D5
+    name: "Purified Water Flow Rate"
+    id: out_rate
+    unit_of_measurement: 'L/min'
+    update_interval: 5s
+    filters:
+      - lambda: return (x / 1920.0);
+    total:
+      id: out_session_total
+      internal: true
+      unit_of_measurement: 'L'
+      device_class: water
+      state_class: total_increasing
+      filters:
+        - lambda: return (x / 1920.0);
+
+  - platform: template
+    id: total_out
+    name: "Total Purified Water Usage"
+    unit_of_measurement: 'L'
+    device_class: water
+    state_class: total_increasing
+    accuracy_decimals: 2
+    update_interval: 10s
+    lambda: 'return id(g_total_out);'
+
+  - platform: template
+    id: today_out
+    name: "Today's Purified Water Usage"
+    unit_of_measurement: 'L'
+    device_class: water
+    state_class: total
+    accuracy_decimals: 2
+    update_interval: 10s
+    lambda: 'return id(g_total_out) - id(g_midnight_out);'
+
+  # 出水 TDS 超标值（= 当前TDS - 阈值，低于0则显示0），方便在 HA 里看超了多少
+  - platform: template
+    id: tds_over
+    name: "Purified Water TDS Excess"
+    unit_of_measurement: 'ppm'
+    accuracy_decimals: 1
+    update_interval: 10s
+    lambda: |-
+      float over = id(tds2).state - id(tds_alarm_threshold).state;
+      return over > 0 ? over : 0.0f;
+
+  # 各滤芯已用天数（只读，便于查看）
+  - platform: template
+    id: filter1_used
+    name: "Filter 1 Used Days"
+    unit_of_measurement: '天'
+    accuracy_decimals: 1
+    update_interval: 60s
+    lambda: |-
+      auto last = id(filter1_dt).state_as_esptime();
+      // date 实体的 state_as_esptime() 不重算 timestamp，手动补齐后再算天数
+      last.hour = 0; last.minute = 0; last.second = 0;
+      last.recalc_timestamp_local();
+      auto now = id(sntp_time).now();
+      if (!last.is_valid(false, false) || !now.is_valid()) return 0.0f;
+      return (now.timestamp - last.timestamp) / 86400.0f;
+  - platform: template
+    id: filter2_used
+    name: "Filter 2 Used Days"
+    unit_of_measurement: '天'
+    accuracy_decimals: 1
+    update_interval: 60s
+    lambda: |-
+      auto last = id(filter2_dt).state_as_esptime();
+      // date 实体的 state_as_esptime() 不重算 timestamp，手动补齐后再算天数
+      last.hour = 0; last.minute = 0; last.second = 0;
+      last.recalc_timestamp_local();
+      auto now = id(sntp_time).now();
+      if (!last.is_valid(false, false) || !now.is_valid()) return 0.0f;
+      return (now.timestamp - last.timestamp) / 86400.0f;
+  - platform: template
+    id: filter3_used
+    name: "Filter 3 Used Days"
+    unit_of_measurement: '天'
+    accuracy_decimals: 1
+    update_interval: 60s
+    lambda: |-
+      auto last = id(filter3_dt).state_as_esptime();
+      // date 实体的 state_as_esptime() 不重算 timestamp，手动补齐后再算天数
+      last.hour = 0; last.minute = 0; last.second = 0;
+      last.recalc_timestamp_local();
+      auto now = id(sntp_time).now();
+      if (!last.is_valid(false, false) || !now.is_valid()) return 0.0f;
+      return (now.timestamp - last.timestamp) / 86400.0f;
+  - platform: template
+    id: filter4_used
+    name: "Filter 4 Used Days"
+    unit_of_measurement: '天'
+    accuracy_decimals: 1
+    update_interval: 60s
+    lambda: |-
+      auto last = id(filter4_dt).state_as_esptime();
+      // date 实体的 state_as_esptime() 不重算 timestamp，手动补齐后再算天数
+      last.hour = 0; last.minute = 0; last.second = 0;
+      last.recalc_timestamp_local();
+      auto now = id(sntp_time).now();
+      if (!last.is_valid(false, false) || !now.is_valid()) return 0.0f;
+      return (now.timestamp - last.timestamp) / 86400.0f;
+  - platform: template
+    id: filter5_used
+    name: "Filter 5 Used Days"
+    unit_of_measurement: '天'
+    accuracy_decimals: 1
+    update_interval: 60s
+    lambda: |-
+      auto last = id(filter5_dt).state_as_esptime();
+      // date 实体的 state_as_esptime() 不重算 timestamp，手动补齐后再算天数
+      last.hour = 0; last.minute = 0; last.second = 0;
+      last.recalc_timestamp_local();
+      auto now = id(sntp_time).now();
+      if (!last.is_valid(false, false) || !now.is_valid()) return 0.0f;
+      return (now.timestamp - last.timestamp) / 86400.0f;
+
+# =====================================================================
+# 阈值设置（均 optimistic + restore_value：在 HA 里改完掉电也保留）
+# =====================================================================
+number:
+  - platform: template
+    id: tds_alarm_threshold
+    name: "Purified Water TDS Alarm Threshold"
+    unit_of_measurement: 'ppm'
+    min_value: 0
+    max_value: 500
+    step: 1
+    optimistic: yes
+    restore_value: true
+    initial_value: '50'
+    mode: box
+    entity_category: config
+
+  # 五级 RO 滤芯默认寿命（天），可按实际水质在 HA 里改
+  # 1=PP棉  2=颗粒活性炭  3=压缩活性炭  4=RO膜  5=后置活性炭
+  - platform: template
+    id: filter1_life
+    name: "Filter 1 (PP Cotton) Life Days"
+    unit_of_measurement: '天'
+    min_value: 1
+    max_value: 3650
+    step: 1
+    optimistic: yes
+    restore_value: true
+    initial_value: '90'
+    mode: box
+    entity_category: config
+  - platform: template
+    id: filter2_life
+    name: "Filter 2 (GAC Carbon) Life Days"
+    unit_of_measurement: '天'
+    min_value: 1
+    max_value: 3650
+    step: 1
+    optimistic: yes
+    restore_value: true
+    initial_value: '180'
+    mode: box
+    entity_category: config
+  - platform: template
+    id: filter3_life
+    name: "Filter 3 (CTO Carbon) Life Days"
+    unit_of_measurement: '天'
+    min_value: 1
+    max_value: 3650
+    step: 1
+    optimistic: yes
+    restore_value: true
+    initial_value: '180'
+    mode: box
+    entity_category: config
+  - platform: template
+    id: filter4_life
+    name: "Filter 4 (RO Membrane) Life Days"
+    unit_of_measurement: '天'
+    min_value: 1
+    max_value: 3650
+    step: 1
+    optimistic: yes
+    restore_value: true
+    initial_value: '730'
+    mode: box
+    entity_category: config
+  - platform: template
+    id: filter5_life
+    name: "Filter 5 (Post Carbon) Life Days"
+    unit_of_measurement: '天'
+    min_value: 1
+    max_value: 3650
+    step: 1
+    optimistic: yes
+    restore_value: true
+    initial_value: '365'
+    mode: box
+    entity_category: config
+
+# =====================================================================
+# 滤芯上次更换日期：optimistic + restore_value = 可在 HA 里直接改日期，
+# 且掉电保持。改日期即“记录/修改更换时间”；按下面按钮则记为“今天已换”。
+# =====================================================================
+datetime:
+  - platform: template
+    id: filter1_dt
+    type: date
+    name: "Filter 1 Last Replace Date"
+    optimistic: yes
+    restore_value: true
+    initial_value: "2026-01-01"
+    entity_category: config
+  - platform: template
+    id: filter2_dt
+    type: date
+    name: "Filter 2 Last Replace Date"
+    optimistic: yes
+    restore_value: true
+    initial_value: "2026-01-01"
+    entity_category: config
+  - platform: template
+    id: filter3_dt
+    type: date
+    name: "Filter 3 Last Replace Date"
+    optimistic: yes
+    restore_value: true
+    initial_value: "2026-01-01"
+    entity_category: config
+  - platform: template
+    id: filter4_dt
+    type: date
+    name: "Filter 4 Last Replace Date"
+    optimistic: yes
+    restore_value: true
+    initial_value: "2026-01-01"
+    entity_category: config
+  - platform: template
+    id: filter5_dt
+    type: date
+    name: "Filter 5 Last Replace Date"
+    optimistic: yes
+    restore_value: true
+    initial_value: "2026-01-01"
+    entity_category: config
+
+# =====================================================================
+# 报警 / 到期判断
+# =====================================================================
+binary_sensor:
+  - platform: template
+    id: tds_alarm
+    name: "Purified Water TDS Alarm"
+    lambda: 'return id(tds2).state > id(tds_alarm_threshold).state;'
+
+  - platform: template
+    id: filter1_due
+    name: "Filter 1 Due"
+    lambda: |-
+      auto last = id(filter1_dt).state_as_esptime();
+      // date 实体的 state_as_esptime() 不重算 timestamp，手动补齐后再算天数
+      last.hour = 0; last.minute = 0; last.second = 0;
+      last.recalc_timestamp_local();
+      auto now = id(sntp_time).now();
+      if (!last.is_valid(false, false) || !now.is_valid()) return false;
+      return ((now.timestamp - last.timestamp) / 86400.0f) >= id(filter1_life).state;
+  - platform: template
+    id: filter2_due
+    name: "Filter 2 Due"
+    lambda: |-
+      auto last = id(filter2_dt).state_as_esptime();
+      // date 实体的 state_as_esptime() 不重算 timestamp，手动补齐后再算天数
+      last.hour = 0; last.minute = 0; last.second = 0;
+      last.recalc_timestamp_local();
+      auto now = id(sntp_time).now();
+      if (!last.is_valid(false, false) || !now.is_valid()) return false;
+      return ((now.timestamp - last.timestamp) / 86400.0f) >= id(filter2_life).state;
+  - platform: template
+    id: filter3_due
+    name: "Filter 3 Due"
+    lambda: |-
+      auto last = id(filter3_dt).state_as_esptime();
+      // date 实体的 state_as_esptime() 不重算 timestamp，手动补齐后再算天数
+      last.hour = 0; last.minute = 0; last.second = 0;
+      last.recalc_timestamp_local();
+      auto now = id(sntp_time).now();
+      if (!last.is_valid(false, false) || !now.is_valid()) return false;
+      return ((now.timestamp - last.timestamp) / 86400.0f) >= id(filter3_life).state;
+  - platform: template
+    id: filter4_due
+    name: "Filter 4 Due"
+    lambda: |-
+      auto last = id(filter4_dt).state_as_esptime();
+      // date 实体的 state_as_esptime() 不重算 timestamp，手动补齐后再算天数
+      last.hour = 0; last.minute = 0; last.second = 0;
+      last.recalc_timestamp_local();
+      auto now = id(sntp_time).now();
+      if (!last.is_valid(false, false) || !now.is_valid()) return false;
+      return ((now.timestamp - last.timestamp) / 86400.0f) >= id(filter4_life).state;
+  - platform: template
+    id: filter5_due
+    name: "Filter 5 Due"
+    lambda: |-
+      auto last = id(filter5_dt).state_as_esptime();
+      // date 实体的 state_as_esptime() 不重算 timestamp，手动补齐后再算天数
+      last.hour = 0; last.minute = 0; last.second = 0;
+      last.recalc_timestamp_local();
+      auto now = id(sntp_time).now();
+      if (!last.is_valid(false, false) || !now.is_valid()) return false;
+      return ((now.timestamp - last.timestamp) / 86400.0f) >= id(filter5_life).state;
+
+# =====================================================================
+# “已更换”按钮：按下即把对应滤芯日期记为今天（掉电保持）
+# =====================================================================
+button:
+  - platform: template
+    id: filter1_reset
+    name: "Filter 1 Reset (Replaced)"
+    on_press:
+      - datetime.date.set:
+          id: filter1_dt
+          date: !lambda 'return id(sntp_time).now();'
+  - platform: template
+    id: filter2_reset
+    name: "Filter 2 Reset (Replaced)"
+    on_press:
+      - datetime.date.set:
+          id: filter2_dt
+          date: !lambda 'return id(sntp_time).now();'
+  - platform: template
+    id: filter3_reset
+    name: "Filter 3 Reset (Replaced)"
+    on_press:
+      - datetime.date.set:
+          id: filter3_dt
+          date: !lambda 'return id(sntp_time).now();'
+  - platform: template
+    id: filter4_reset
+    name: "Filter 4 Reset (Replaced)"
+    on_press:
+      - datetime.date.set:
+          id: filter4_dt
+          date: !lambda 'return id(sntp_time).now();'
+  - platform: template
+    id: filter5_reset
+    name: "Filter 5 Reset (Replaced)"
+    on_press:
+      - datetime.date.set:
+          id: filter5_dt
+          date: !lambda 'return id(sntp_time).now();'
+
+  # 累计流量清零：把总累计、今日基准、并入基准一起复位。
+  # 关键：g_last_session_* 必须设为当前 session 读数，否则下一个 30s
+  # interval 会把本次上电已计的流量重新加回总量，出现“清了又涨”。
+  - platform: template
+    id: reset_water_totals
+    name: "Reset Water Totals"
+    on_press:
+      - lambda: |-
+          id(g_total_in) = 0.0f;
+          id(g_total_out) = 0.0f;
+          id(g_midnight_in) = 0.0f;
+          id(g_midnight_out) = 0.0f;
+          // pulse_counter 的 total 无法从代码清零，只能把并入基准
+          // 设为它当前的读数，使其增量从清零这一刻重新开始算。
+          id(g_last_session_in) = id(in_session_total).state;
+          id(g_last_session_out) = id(out_session_total).state;
+          auto now = id(sntp_time).now();
+          if (now.is_valid()) id(g_last_day) = now.day_of_month;
+          // 立即刷新显示，不必等 10s 的 update_interval
+          id(total_in).publish_state(0.0f);
+          id(total_out).publish_state(0.0f);
+          id(today_in).publish_state(0.0f);
+          id(today_out).publish_state(0.0f);
+
+  # 手动重启 ESP（掉线/调试时用）
+  - platform: restart
+    name: "Restart ESP"
+
+# =====================================================================
+# 汇总文本：一个实体就看出当前有没有需要处理的事项，方便 HA 通知
+# =====================================================================
+text_sensor:
+  - platform: template
+    name: "Purifier Status Summary"
+    update_interval: 30s
+    lambda: |-
+      std::string msg;
+      if (id(tds_alarm).state) msg += "Purified TDS High ";
+      if (id(filter1_due).state) msg += "PP棉 ";
+      if (id(filter2_due).state) msg += "活性炭1 ";
+      if (id(filter3_due).state) msg += "活性炭2 ";
+      if (id(filter4_due).state) msg += "RO膜 ";
+      if (id(filter5_due).state) msg += "后置碳 ";
+      if (msg.empty()) return {"All Normal"};
+      return {"Action Needed: " + msg};
+
+switch:
+  - platform: template
+    name: "TDS Switch"
+    id: "tds_switch"
+    restore_mode: ALWAYS_ON
+    lambda: return id(tds_switch).state;
+    optimistic: true
+    # turn_on_action:
+      # - uart.write: [0x55, 0x07, 0x05, 0x01, 0x00, 0x00, 0x00, 0x62]
+      # - uart.write: [0x55, 0x07, 0x03, 0x01, 0x01, 0x0B, 0xCA, 0x36]
+    turn_off_action:
+      - uart.write: [0x55, 0x07, 0x06, 0x00, 0x00, 0x00, 0x00, 0x62]
+    #   - uart.write: [0x55, 0x07, 0x05, 0x02, 0x00, 0x00, 0x00, 0x63]
+      # - switch.turn_on: switch1
+
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: "Asia/Shanghai"   # 设为本地时区，滤芯按本地日期计算
+    on_time:
+      - seconds: /2
+        then:
+          - if:
+              condition:
+                lambda: |-
+                  if (id(tds_switch).state == true) {
+                    auto time = id(sntp_time).now();
+                    return time.second != 0;
+                  }
+                  return false;
+              then:
+                - uart.write: [0x55, 0x07, 0x05, 0x01, 0x00, 0x00, 0x00, 0x62]
+
+      - seconds: /5
+        then:
+          - if:
+              condition:
+                lambda: |-
+                  return id(tds_switch).state == true;
+              then:
+                - uart.write: [0x55, 0x07, 0x05, 0x02, 0x00, 0x00, 0x00, 0x63]
+
+# =====================================================================
+# 核心修复：把“本次上电累计”定期并入掉电保持的全局变量，并做跨天归零。
+# 这样无论何时掉电，Total Water Usage / Total Purified Water Usage 都不会清零。
+# =====================================================================
+interval:
+  # 50ms 轮询 UART：直接按帧头解析 TDS 模块返回的 11 字节帧（替代已移除的 custom 组件）
+  - interval: 50ms
+    then:
+      - lambda: |-
+          static uint8_t idx = 0;
+          static uint8_t frame[11] = {0};
+          while (id(uart_bus1).available()) {
+            uint8_t b = 0;
+            if (!id(uart_bus1).read_byte(&b)) break;
+            if (idx == 0) {
+              if (b == 0x55) frame[idx++] = b;
+            } else if (idx == 1) {
+              if (b == 0x0A) frame[idx++] = b; else idx = 0;
+            } else if (idx == 2) {
+              if (b == 0x85) frame[idx++] = b; else idx = 0;
+            } else {
+              frame[idx++] = b;
+              if (idx >= 11) {
+                int channel = frame[3];
+                float tds = (float(frame[4]) * 255.0f + frame[5]) / 20.0f;
+                float temp = (float(frame[6]) * 255.0f + frame[7]) / 10.0f;
+                if (channel == 1) {
+                  id(tds1).publish_state(tds);
+                  id(temperature1).publish_state(temp);
+                } else if (channel == 2) {
+                  id(tds2).publish_state(tds);
+                  id(temperature2).publish_state(temp);
+                }
+                idx = 0;
+              }
+            }
+          }
+
+  - interval: 30s
+    then:
+      - lambda: |-
+          // 只把“本次上电累计的增量”并入持久化总量，避免重复计算。
+          // g_total_* 已经是总量本身（不再叠加 session），g_last_session_* 只记录
+          // 上次并入时 session 的读数；重启后两者都从 0 开始，天然对齐。
+          float sin = id(in_session_total).state;
+          if (sin >= id(g_last_session_in)) {
+            id(g_total_in) += (sin - id(g_last_session_in));
+          }
+          id(g_last_session_in) = sin;
+
+          float sout = id(out_session_total).state;
+          if (sout >= id(g_last_session_out)) {
+            id(g_total_out) += (sout - id(g_last_session_out));
+          }
+          id(g_last_session_out) = sout;
+
+          // 跨天检测：日期变了就把“当日基准”刷新为当前总量（也覆盖错过午夜的情况）
+          auto now = id(sntp_time).now();
+          if (now.is_valid()) {
+            if (id(g_last_day) != now.day_of_month) {
+              id(g_midnight_in) = id(g_total_in);
+              id(g_midnight_out) = id(g_total_out);
+              id(g_last_day) = now.day_of_month;
+            }
+          }
+
