@@ -40,6 +40,7 @@ wifi_ssid: "你的WiFi名称"
 wifi_password: "你的WiFi密码"
 ota_password: "请替换为足够长的随机密码"
 fallback_ap_password: "请替换为备用热点密码"
+api_encryption_key: "用 openssl rand -base64 32 生成"
 ```
 
 可直接复制 `secrets.example.yaml` 作为起点。
@@ -96,7 +97,8 @@ ESP8266 默认把 `restore_value` 存在 RTC memory，完全断电会丢。本�
 ## 7. 已知注意事项
 
 - 配置使用 `!secret wifi_ssid` / `!secret wifi_password`，没有本地 WiFi 凭据时无法编译。
-- 不要把本地 `secrets.yaml` 提交到仓库；OTA 和 Fallback AP 凭据应使用强密码。
+- 不要把本地 `secrets.yaml` 提交到仓库；OTA、Fallback AP 和 API 加密密钥都应使用强随机值。
+- ESPHome 2026.11+ 已移除 `api: password:`；本仓库配置使用 `api: encryption: key: !secret api_encryption_key`。
 - TDS 串口帧解析假设帧头 `55 0A 85`、11 字节帧；若换 TDS 模块固件，需重新抓 UART 验证。
 - SNTP 未成功同步前，滤芯天数会显示 0，这是正常保护行为。
 - 本配置面向 ESPHome 2026.11+；旧版 ESPHome 可能不支持 `compile_process_limit` 或 `storage: flash` 写法。
